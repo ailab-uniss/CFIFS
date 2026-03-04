@@ -18,6 +18,7 @@ results/
 outputs/
 baselines/
 references/
+scripts/
 
 # Paper sources (not part of the code release)
 paper_latex/
