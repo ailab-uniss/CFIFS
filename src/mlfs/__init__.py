@@ -1,3 +1,6 @@
-from .dagfs_v2 import DAGFSv2Params as DAGFSParams, dagfs_v2 as dagfs
+from .cfifs_embedded import CFIFSParams, fit_cfifs
 
-__all__ = ["DAGFSParams", "dagfs"]
+__all__ = [
+    "CFIFSParams",
+    "fit_cfifs",
+]

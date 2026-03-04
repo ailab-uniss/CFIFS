@@ -6,48 +6,29 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+*.egg-info/
 
 # Environments
 .venv/
 venv/
 
-# Large / non-redistributable assets (not ours)
+# Large / non-redistributable assets
 data/
-baselines/
 results/
-paper/
+outputs/
+baselines/
 references/
 
-# Local notes / instruction markdowns (keep locally, do not commit)
-istruzioni_innovazione_A_B_C.md
-piano estensione paper.md
-protocollo_downstream_completo.md
-rimozione_downstream.md
-ristrutturazione_paper.md
-paper_mod_instructions.md
-protocollo_downstream.md
-protocollo_downstream_completo.md
-ablation.md
-new_ideas.md
-variante.md
-rimozione_downstream.md
+# Paper sources (not part of the code release)
+paper_latex/
 
-# Internal research scripts / drafts (keep locally, do not commit)
-scripts/_internal/
-docs/_internal/
-src/mlfs/roadmap.md
-src/mlfs/ml-knn-gpu.py
+# Local notes
+*.md
+!README.md
 
-# LaTeX build artifacts
-paper/*.aux
-paper/*.bbl
-paper/*.blg
-paper/*.log
-paper/*.out
-paper/*.spl
-paper/*.synctex.gz
-paper/*.pdf
-paper/_local/
-
-# Deprecated figure exports
-paper/figures/pgrid_curves_extra.pdf
+# Misc
+*.patch
+*.log
+*.out
+*.zip
+*.pid

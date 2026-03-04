@@ -1,141 +1,236 @@
-# DAGFS — Directed Additive Graph Feature Selection (Multi-label FS)
+# CFIFS — Choquet Fuzzy-Integral Feature Selection for Multi-Label Data
 
-This repository contains the reference Python implementation of **DAGFS**, an embedded method for **multi-label feature selection (MLFS)**.
-At a high level, DAGFS produces a **single feature ranking per training fold** by combining:
+Reference Python / PyTorch implementation of the method described in:
 
-- a **nonnegative reconstruction** template with group sparsity (stable multiplicative updates),
-- a **signed-deviation feature lift** to represent *two-sided evidence* under nonnegativity,
-- **rarity-aware instance reweighting** (training-only) to stabilise learning under heterogeneous supervision,
-- a **directed label-transfer regulariser** to control correlation transfer across labels.
+> **Choquet-Based Fusion of Embedded and Spectral Scores for Multi-Label Feature Selection**
+> F. Casu, A. Lagorio & G. A. Trunfio — *Information Fusion*, 2026.
 
-The code is intended to be usable independently of the paper experiments: you can run DAGFS on your own datasets and evaluate any downstream classifier you prefer.
+CFIFS produces a **single feature ranking per training fold** by:
 
-## What is (and is not) included
+1. **Embedded scoring** — a convex group-sparse solver that combines squared-reconstruction and per-label logistic losses with rarity-aware instance weighting (§ 3.1–3.2 of the paper).
+2. **Spectral scoring** — SLAGD: Dirichlet energy on a label-affinity graph combined with an HSIC term (§ 3.3).
+3. **Rank normalisation** — empirical-CDF mapping to [0, 1] so that the two channels are commensurate (§ 3.4).
+4. **Choquet integral fusion** — a 2-source non-additive fuzzy integral with free singleton capacities (μₑ, μₛ), selected by an inner K-fold CV loop that maximises the geometric mean of Micro-F1 and Macro-F1 evaluated with ML-kNN on the top-*p*% features (§ 3.4–3.5).
 
-- ✅ **Included (ours):** DAGFS implementation (`src/`) and scripts to run DAGFS and evaluate rankings (`scripts/`).
-- ❌ **Not included:** datasets and third‑party baselines. 
+---
+
+## What is included
+
+| Item | Description |
+|------|-------------|
+| `src/mlfs/` | Core library — embedded solver, spectral scorer, GPU ML-kNN |
+| `scripts/run_cfifs.py` | **Main runner** (embedding → spectral → Choquet fusion) |
+| `scripts/run_cfifs_ablation.py` | Ablation variants (EMB-only, REG-only, no weights, …) |
+| `scripts/eval_rankings_gpu_mlknn.py` | Evaluate a set of rankings on a *p*-grid with ML-kNN |
+| `scripts/make_paper_materials.py` | Generate LaTeX tables and figures from result JSONs |
+| `scripts/make_method_figures.py` | Produce the illustrative method figures |
+| `scripts/make_pgrid_curves.py` | *p*-grid performance curves |
+| `baselines/` | MATLAB wrappers for the 7 baseline methods (GRRO, SRFS, RFSFS, LRMFS, LSMFS, LRDG, SCNMF) |
+
+## What is **not** included
+
+**Datasets** are not redistributed because the original licences may not permit it.  All 20 benchmarks used in the paper are publicly available:
+
+| Domain | Datasets |
+|--------|----------|
+| Text (Yahoo) | Arts, Business, Computers, Education, Entertain, Health, Recreation, Science, Social |
+| Image | Image, Birds, Corel16k1, Corel16k2 |
+| Other | Flags, Slashdot, Yelp |
+| Biology | genbase, medical, yeast, Human |
+
+Standard sources: [Mulan](http://mulan.sourceforge.net/datasets-mlc.html), [KDIS](https://www.uco.es/kdis/mllresources/), [Cometa](http://www.omsz.eu/en/cometa/).
+
+---
 
 ## Installation
-
-Create a virtual environment and install the package in editable mode:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python3 -m pip install -U pip
-python3 -m pip install -e ".[experiments]"
+pip install -U pip
+pip install -e ".[experiments]"
 ```
 
-Core DAGFS only requires NumPy. The `experiments` extra installs the scientific stack used by the provided scripts.
+**Core** (`src/mlfs/`) only requires **NumPy ≥ 1.23**.
+The `[experiments]` extra pulls in SciPy, scikit-learn, scikit-multilearn, and Matplotlib.
+**GPU acceleration** requires [PyTorch](https://pytorch.org/get-started/locally/) — install it separately matching your CUDA version.
 
-## Quickstart (API)
+---
+
+## Quickstart (Python API)
 
 ```python
 import numpy as np
-from dagfs import DAGFSParams, dagfs
+from mlfs import CFIFSParams, fit_cfifs
 
-# X: (n_samples, n_features) float, preferably scaled to [0,1]
-# Y: (n_samples, n_labels) in {0,1}
+# X: (n_samples, n_features) float array, preferably scaled to [0,1]
+# Y: (n_samples, n_labels)   binary {0,1}
 
-params = DAGFSParams(
-    alpha=0.10,
-    beta=0.10,
-    max_iter=40,
-    feature_lift="center_split",
-    paired_penalty=True,
+params = CFIFSParams(
+    alpha=0.35,          # trade-off: regression vs. logistic loss
+    beta=0.01,           # group-lasso strength (ℓ₂₁ penalty)
+    rho=1e-4,            # ridge regulariser
+    rank=50,             # label-embedding dimension
+    backend="torch",     # "numpy" or "torch"
+    device="cuda",       # "cpu" or "cuda"
 )
-
-ranking_1based, W, info = dagfs(X, Y, params)
-print(ranking_1based[:10], info)
+ranking, info = fit_cfifs(X, Y, params)
+# ranking: 1-based feature indices sorted best → worst
+# info["scores"]: per-feature importance (row norms of W)
 ```
 
-`ranking_1based` is a 1‑based permutation of feature indices (MATLAB‑friendly). Use `ranking_1based - 1` for 0‑based Python indexing.
+---
 
-## Running experiments (scripts)
+## Reproducing the paper results
 
-The scripts assume a **folded dataset layout** (one folder per dataset, one file per fold):
+### 1. Prepare the data
+
+Arrange each dataset in the **folded layout** expected by the scripts:
 
 ```
-<DATA_DIR>/<DatasetName>/
-  fold0.mat
+data/<DatasetName>/
+  fold0.mat        # contains X_train, Y_train, X_test, Y_test
   fold1.mat
   ...
+  fold9.mat
 ```
 
-Each `fold*.mat` must contain:
+Each `.mat` file must contain four variables:
+- `X_train` — `(n_train, d)` float, min-max normalised to [0, 1] on the training set
+- `Y_train` — `(n_train, L)` binary `{0, 1}`
+- `X_test`  — `(n_test, d)` float, normalised using the training statistics
+- `Y_test`  — `(n_test, L)` binary `{0, 1}`
 
-- `X_train`: shape `(n_train, d)`
-- `Y_train`: shape `(n_train, L)` in `{0,1}`
-- `X_test`:  shape `(n_test,  d)`
-- `Y_test`:  shape `(n_test,  L)` in `{0,1}`
+Use `scripts/freeze_panorama_cv10.py` to create 10-fold stratified splits from raw ARFF/CSV sources.
 
-### 1) Produce DAGFS rankings
+### 2. Run CFIFS (all datasets, 10 folds)
 
 ```bash
-python3 scripts/run_dagfs_custom.py \
-  --data-dir <DATA_DIR> \
-  --output-dir <RESULTS_DIR> \
-  --method-name DAGFS \
-  --folds 10
+python scripts/run_cfifs.py \
+    --data-dir data/panorama30_matlab_minmax_cv10 \
+    --results-dir results/bench_panorama30_cv10 \
+    --method CFIFS \
+    --score-norm rank \
+    --capacity-mode free \
+    --mu-grid "0.0,0.2,0.4,0.6,0.8,1.0" \
+    --icv-criterion gm \
+    --icv-aggregate hard \
+    --folds 10 \
+    --device cuda
 ```
 
-This writes:
+This writes, for each dataset × fold:
+- `<results>/CFIFS/<dataset>_fold<k>_ranking.csv` — 1-based feature ranking
+- `<results>/CFIFS/<dataset>_fold<k>_info.json` — metadata (capacity values, timing, …)
 
-- `<RESULTS_DIR>/DAGFS/<dataset>_fold<k>_ranking.csv`
-
-### 2) Evaluate rankings on a p-grid with ML-kNN (Python)
+### 3. Run ablation variants
 
 ```bash
-python3 scripts/eval_rankings_py_pgrid_fast.py \
-  --results-dir <RESULTS_DIR> \
-  --data-dir <DATA_DIR> \
-  --methods DAGFS \
-  --folds 10 \
-  --p-min 0.05 --p-max 0.50 --p-step 0.05 --p-target 0.20
+for variant in CFIFS_EMB ACSF_REG ACSF_LOG ACSF_NOWT ACSF_SIMPLE; do
+    python scripts/run_cfifs_ablation.py \
+        --data-dir data/panorama30_matlab_minmax_cv10 \
+        --results-dir results/bench_panorama30_cv10 \
+        --method $variant \
+        --folds 10 \
+        --device cuda
+done
 ```
 
-This produces per fold:
+### 4. Run baselines (MATLAB)
 
-- `<RESULTS_DIR>/DAGFS/<dataset>_fold<k>_pgrid_metrics.json`
+```matlab
+cd baselines
+run_suite('../results/bench_panorama30_cv10', ...
+          '../data/panorama30_matlab_minmax_cv10', ...
+          {'Arts','Birds','Business',...}, ...   % dataset list
+          {'GRRO','SRFS','RFSFS','LRMFS','LSMFS','LRDG','SCNMF'}, ...
+          'folds', 10, 'rank_only', true);
+```
 
-### 3) Aggregate results + statistical tests + plots
+### 5. Evaluate rankings on a *p*-grid
 
 ```bash
-python3 scripts/aggregate_kgrid_and_make_tables.py \
-  --results-dir <RESULTS_DIR> \
-  --grid-mode pgrid --p-target 0.2 \
-  --methods DAGFS \
-  --out-dir outputs/tables
-
-python3 scripts/make_pgrid_curves.py \
-  --results-dir <RESULTS_DIR> \
-  --methods DAGFS \
-  --out-dir outputs/figures
+python scripts/eval_rankings_gpu_mlknn.py \
+    --results-dir results/bench_panorama30_cv10 \
+    --data-dirs data/panorama30_matlab_minmax_cv10 \
+    --methods CFIFS CFIFS_EMB GRRO SRFS RFSFS LRMFS LSMFS LRDG SCNMF \
+    --folds 10 \
+    --p-min 0.05 --p-max 0.50 --p-step 0.05 --p-target 0.20 \
+    --device cuda
 ```
 
-## Reproducibility notes
+### 6. Generate tables and figures
 
-- **Training-only preprocessing:** any statistic used by DAGFS (lift mean, label frequencies, label similarity) is computed on the training fold only.
-- **Scaling:** DAGFS is designed for nonnegative data. For most benchmarks we use **min–max scaling to `[0,1]` per fold** (fit on train, applied to test).
-- **Folds:** for multi-label data, use **iterative stratification** to preserve label proportions across folds; see `scripts/export_cv_splits_to_mat.py`.
+```bash
+python scripts/make_paper_materials.py \
+    --results-dir results/bench_panorama30_cv10 \
+    --out-dir outputs/paper_materials
+
+python scripts/make_pgrid_curves.py \
+    --results-dir results/bench_panorama30_cv10 \
+    --out-dir outputs/paper_materials
+
+python scripts/make_method_figures.py \
+    --out-dir outputs/paper_materials
+```
+
+---
 
 ## Repository structure
 
-- `src/`: DAGFS implementation (public API)
-- `scripts/`: runnable pipelines (ranking, evaluation, aggregation, plotting)
+```
+src/mlfs/
+  __init__.py                   # public API: CFIFSParams, fit_cfifs
+  cfifs_embedded.py             # embedded scoring (NumPy + PyTorch solvers)
+  spectral_mlfs.py              # spectral scoring (SLAGD)
+  ml_knn_gpu.py                 # GPU-accelerated ML-kNN classifier
+  _components/
+    instance_weights.py         # rarity-aware instance weighting
+
+scripts/
+  run_cfifs.py                  # main CFIFS runner (embedding + spectral + Choquet)
+  run_cfifs_ablation.py         # embedded-only ablation variants
+  run_rfsfs.py                  # Python re-implementation of RFSFS baseline
+  eval_rankings_gpu_mlknn.py    # evaluate rankings on a p-grid (GPU ML-kNN)
+  eval_rankings_py_pgrid_fast.py# helper: p-grid metric computation
+  make_paper_materials.py       # generate LaTeX tables & figures
+  make_method_figures.py        # illustrative method diagrams
+  make_pgrid_curves.py          # p-grid performance curves
+  make_cfifs_ablation_tables.py # ablation result tables
+  aggregate_kgrid_and_make_tables.py  # aggregate grid results
+  export_dense_benchmark_to_mat.py    # convert datasets to .mat
+  export_cv_splits_to_mat.py    # export stratified CV splits
+  build_panorama30_root.py      # assemble the multi-source benchmark
+  freeze_panorama_cv10.py       # freeze 10-fold stratified splits
+
+baselines/                      # MATLAB wrappers for 7 baseline methods
+paper_latex/                    # LaTeX sources of the paper
+```
+
+---
+
+## Reproducibility notes
+
+- **Training-only preprocessing:** every statistic (label embedding, rarity weights, affinity graph) is computed on the training fold only — no test information leaks.
+- **Scaling:** data is min-max normalised to [0, 1] per fold (fit on train, applied to test).
+- **Stratification:** folds are created with iterative stratification to preserve label proportions.
+- **Determinism:** all random seeds are fixed (default `--seed 42`).  NumPy RNG is used even in the PyTorch solver to guarantee cross-backend reproducibility.
+
+---
 
 ## Citation
 
-If you use this code, please cite the accompanying paper.
+If you use this code in your research, please cite:
 
-## Smoke test
-
-After installation (ideally with the `experiments` extra), you can run a quick end-to-end sanity check:
-
-```bash
-python3 scripts/smoke_test.py
+```bibtex
+@article{casu2026cfifs,
+  title   = {Choquet-Based Fusion of Embedded and Spectral Scores for Multi-Label Feature Selection},
+  author  = {Casu, Filippo and Lagorio, Andrea and Trunfio, Giuseppe A.},
+  journal = {Information Fusion},
+  year    = {2026},
+}
 ```
 
 ## License
 
-MIT License. See `LICENSE`.
+[MIT](LICENSE)

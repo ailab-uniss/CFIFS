@@ -132,7 +132,7 @@ def aggregate(
     p_target: float,
 ) -> Tuple[List[str], List[str], Dict[str, Dict[str, Dict[str, Cell]]]]:
     methods = list(methods_order) if methods_order is not None else sorted(data.keys())
-    datasets = sorted({ds for m in methods for ds in data[m].keys()})
+    datasets = sorted({ds for m in methods for ds in data[m].keys() if ds.lower() != "reference"})
 
     agg: Dict[str, Dict[str, Dict[str, Cell]]] = defaultdict(lambda: defaultdict(dict))
 
@@ -226,7 +226,7 @@ def make_metric_table_tex(
         s = str(ds)
         if not s:
             return ""
-        return latex_escape(s[:1].upper() + s[1:].lower())
+        return latex_escape(s).capitalize()
 
     def build_rows(block_methods: List[str], metric: str) -> List[str]:
         lines = []
@@ -282,6 +282,96 @@ def make_metric_table_tex(
     lines.append(f"\\caption{{{caption}}}")
     lines.append(f"\\label{{{label}}}")
     lines.append("\\end{table*}")
+    return "\n".join(lines) + "\n"
+
+
+METRIC_DISPLAY_NAMES = {
+    "micro_f1": "Micro-F1",
+    "macro_f1": "Macro-F1",
+    "hamming_loss": "Hamming Loss",
+    "one_error": "One-error",
+    "micro_pr_auc": "Micro PR-AUC",
+    "macro_pr_auc": "Macro PR-AUC",
+    "avg_precision": "AvgPrec",
+}
+
+
+def make_stacked_metric_table_tex(
+    methods: List[str],
+    datasets: List[str],
+    agg: Dict[str, Dict[str, Dict[str, Cell]]],
+    metrics: List[str],
+    caption: str,
+    label: str,
+    *,
+    display_map: Dict[str, str] | None = None,
+) -> str:
+    """Generate a landscape table with multiple metric blocks stacked vertically.
+
+    Each block shows one metric with all datasets as rows and methods as columns.
+    Format: mean ± std, best per dataset in bold.  Wrapped in landscape environment.
+    """
+    display_map = display_map or {}
+    display_methods = [display_map.get(m, m) for m in methods]
+    methods_tex = [latex_escape(m) for m in display_methods]
+    n_methods = len(methods)
+
+    def format_ds(ds: str) -> str:
+        s = str(ds)
+        if not s:
+            return ""
+        return latex_escape(s).capitalize()
+
+    lines: List[str] = []
+    lines.append("\\begin{landscape}")
+    lines.append("\\begin{table}[!t]")
+    lines.append("\\centering")
+    lines.append("\\scriptsize")
+    lines.append("\\setlength{\\tabcolsep}{3pt}")
+    lines.append("\\begin{tabular}{l" + "c" * n_methods + "}")
+    lines.append("\\toprule")
+
+    # Header row: Dataset & Method1 & Method2 & ...
+    lines.append("Dataset & " + " & ".join(methods_tex) + " \\\\")
+
+    for mi, metric in enumerate(metrics):
+        higher_is_better = metric in (
+            "micro_f1", "macro_f1", "micro_pr_auc", "macro_pr_auc", "avg_precision",
+        )
+        # Best mask for this metric
+        best_by_ds: Dict[str, Dict[str, bool]] = {}
+        for ds in datasets:
+            vals = {}
+            for method in methods:
+                if ds in agg[method]:
+                    vals[method] = agg[method][ds][metric].mean
+            best_by_ds[ds] = best_mask(vals, higher_is_better)
+
+        # Metric label row
+        metric_name = METRIC_DISPLAY_NAMES.get(metric, metric)
+        lines.append("\\midrule")
+        lines.append(
+            f"\\multicolumn{{{n_methods + 1}}}{{l}}{{\\textbf{{{metric_name}}}}} \\\\"
+        )
+        lines.append("\\midrule")
+
+        # Data rows
+        for ds in datasets:
+            row_cells = []
+            for method in methods:
+                c = agg[method][ds][metric]
+                s = format_cell(c)
+                if best_by_ds[ds].get(method, False):
+                    s = f"\\textbf{{{s}}}"
+                row_cells.append(s)
+            lines.append(format_ds(ds) + " & " + " & ".join(row_cells) + " \\\\")
+
+    lines.append("\\bottomrule")
+    lines.append("\\end{tabular}")
+    lines.append(f"\\caption{{{caption}}}")
+    lines.append(f"\\label{{{label}}}")
+    lines.append("\\end{table}")
+    lines.append("\\end{landscape}")
     return "\n".join(lines) + "\n"
 
 
@@ -367,7 +457,13 @@ def make_stats_tex(
                     continue
                 other = np.asarray(per_method[m], dtype=float)
                 try:
-                    p = float(wilcoxon(ref_vals, other, zero_method="wilcox", alternative="two-sided").pvalue)
+                    # One-sided in the direction of the reference advantage:
+                    # - higher-is-better: H1 median(ref-other) > 0
+                    # - lower-is-better : H1 median(other-ref) > 0  (i.e., ref < other)
+                    if higher_is_better(metric):
+                        p = float(wilcoxon(ref_vals, other, zero_method="wilcox", alternative="greater").pvalue)
+                    else:
+                        p = float(wilcoxon(other, ref_vals, zero_method="wilcox", alternative="greater").pvalue)
                 except ValueError:
                     p = 1.0
                 p_raw[m] = p
@@ -404,8 +500,8 @@ def make_stats_tex(
             g = gain(ref_vals, other_vals)
             g_txt = f"{g:.4f}"
             wtl_txt = wtl(ref_vals, other_vals)
-            p_txt = f"{p_raw[name]:.3g}"
-            p_adj_txt = f"{p_adj:.3g}"
+            p_txt = f"{p_raw[name]:.2e}"
+            p_adj_txt = f"{p_adj:.2e}"
             sig = "\\ding{51}" if p_adj <= 0.05 else ""
 
             # Keep the first two columns empty; the metric block line above already labels the metric.
@@ -592,6 +688,12 @@ def main() -> None:
     methods, datasets, agg = aggregate(data, methods_order=args.methods, grid_mode=grid_mode, p_target=p_target)
     display_map = load_display_map(args.display_map)
 
+    # Detect actual fold count from data for captions
+    _n_folds = max(
+        (max(data[m][ds].keys()) + 1 for m in data for ds in data[m] if data[m][ds]),
+        default=5,
+    )
+
     # CSV (mean only) for convenience
     csv_name = "benchmark_means_kgrid.csv" if grid_mode == "kgrid" else f"benchmark_means_p{int(round(100*p_target))}.csv"
     csv_path = out_dir / csv_name
@@ -606,13 +708,13 @@ def main() -> None:
 
     if grid_mode == "pgrid":
         pct = int(round(100 * float(p_target)))
-        micro_caption = f"Micro-F1 at {pct}\\% selected features (mean $\\\\pm$ std over 5 folds). Best per dataset in bold."
-        macro_caption = f"Macro-F1 at {pct}\\% selected features (mean $\\\\pm$ std over 5 folds). Best per dataset in bold."
-        hl_caption = f"Hamming Loss at {pct}\\% selected features (mean $\\\\pm$ std over 5 folds). Best (lowest) per dataset in bold."
-        micro_pr_caption = f"Micro PR-AUC at {pct}\\% selected features (mean $\\\\pm$ std over 5 folds). Best per dataset in bold."
-        macro_pr_caption = f"Macro PR-AUC at {pct}\\% selected features (mean $\\\\pm$ std over 5 folds). Best per dataset in bold."
-        avgprec_caption = f"AvgPrec at {pct}\\% selected features (mean $\\\\pm$ std over 5 folds). Best per dataset in bold."
-        oneerr_caption = f"One-error at {pct}\\% selected features (mean $\\\\pm$ std over 5 folds). Best (lowest) per dataset in bold."
+        micro_caption = f"Micro-F1 at {pct}\\% selected features (mean $\\\\pm$ std over {_n_folds} folds). Best per dataset in bold."
+        macro_caption = f"Macro-F1 at {pct}\\% selected features (mean $\\\\pm$ std over {_n_folds} folds). Best per dataset in bold."
+        hl_caption = f"Hamming Loss at {pct}\\% selected features (mean $\\\\pm$ std over {_n_folds} folds). Best (lowest) per dataset in bold."
+        micro_pr_caption = f"Micro PR-AUC at {pct}\\% selected features (mean $\\\\pm$ std over {_n_folds} folds). Best per dataset in bold."
+        macro_pr_caption = f"Macro PR-AUC at {pct}\\% selected features (mean $\\\\pm$ std over {_n_folds} folds). Best per dataset in bold."
+        avgprec_caption = f"AvgPrec at {pct}\\% selected features (mean $\\\\pm$ std over {_n_folds} folds). Best per dataset in bold."
+        oneerr_caption = f"One-error at {pct}\\% selected features (mean $\\\\pm$ std over {_n_folds} folds). Best (lowest) per dataset in bold."
         micro_label = "tab:microf1_pgrid"
         macro_label = "tab:macrof1_pgrid"
         hl_label = "tab:hamming_pgrid"
@@ -623,13 +725,13 @@ def main() -> None:
         stats_label = "tab:stats_pgrid"
         ranks_label = "tab:ranks_pgrid"
     else:
-        micro_caption = "Micro-F1 averaged over the feature-count grid (mean $\\pm$ std over 5 folds). Best per dataset in bold."
-        macro_caption = "Macro-F1 averaged over the feature-count grid (mean $\\pm$ std over 5 folds). Best per dataset in bold."
-        hl_caption = "Hamming Loss averaged over the feature-count grid (mean $\\pm$ std over 5 folds). Best (lowest) per dataset in bold."
-        micro_pr_caption = "Micro PR-AUC averaged over the feature-count grid (mean $\\pm$ std over 5 folds). Best per dataset in bold."
-        macro_pr_caption = "Macro PR-AUC averaged over the feature-count grid (mean $\\pm$ std over 5 folds). Best per dataset in bold."
-        avgprec_caption = "AvgPrec averaged over the feature-count grid (mean $\\pm$ std over 5 folds). Best per dataset in bold."
-        oneerr_caption = "One-error averaged over the feature-count grid (mean $\\pm$ std over 5 folds). Best (lowest) per dataset in bold."
+        micro_caption = f"Micro-F1 averaged over the feature-count grid (mean $\\pm$ std over {_n_folds} folds). Best per dataset in bold."
+        macro_caption = f"Macro-F1 averaged over the feature-count grid (mean $\\pm$ std over {_n_folds} folds). Best per dataset in bold."
+        hl_caption = f"Hamming Loss averaged over the feature-count grid (mean $\\pm$ std over {_n_folds} folds). Best (lowest) per dataset in bold."
+        micro_pr_caption = f"Micro PR-AUC averaged over the feature-count grid (mean $\\pm$ std over {_n_folds} folds). Best per dataset in bold."
+        macro_pr_caption = f"Macro PR-AUC averaged over the feature-count grid (mean $\\pm$ std over {_n_folds} folds). Best per dataset in bold."
+        avgprec_caption = f"AvgPrec averaged over the feature-count grid (mean $\\pm$ std over {_n_folds} folds). Best per dataset in bold."
+        oneerr_caption = f"One-error averaged over the feature-count grid (mean $\\pm$ std over {_n_folds} folds). Best (lowest) per dataset in bold."
         micro_label = "tab:microf1_kgrid"
         macro_label = "tab:macrof1_kgrid"
         hl_label = "tab:hamming_kgrid"
@@ -782,6 +884,65 @@ def main() -> None:
     )
 
     print(f"✓ Wrote tables to: {out_dir} (grid={grid_mode})")
+
+    # ---- Stacked landscape tables (multiple metrics per table) ----
+    if grid_mode == "pgrid":
+        pct = int(round(100 * float(p_target)))
+        stacked_tables = [
+            {
+                "metrics": ["micro_f1", "macro_f1"],
+                "filename": "table_stacked_f1.tex",
+                "caption": (
+                    f"Main comparison at $p = {pct}\\%$ selected features "
+                    f"(mean $\\pm$ std over {_n_folds} folds). "
+                    f"Blocks report different metrics (higher is better). "
+                    f"Best per dataset in bold."
+                ),
+                "label": f"tab:stacked_f1_{grid_mode}",
+            },
+            {
+                "metrics": ["hamming_loss", "one_error"],
+                "filename": "table_stacked_hloe.tex",
+                "caption": (
+                    f"Main comparison at $p = {pct}\\%$ selected features "
+                    f"(mean $\\pm$ std over {_n_folds} folds). "
+                    f"Blocks report different metrics (lower is better). "
+                    f"Best per dataset in bold."
+                ),
+                "label": f"tab:stacked_hloe_{grid_mode}",
+            },
+            {
+                "metrics": ["micro_pr_auc", "macro_pr_auc", "avg_precision"],
+                "filename": "table_stacked_prauc.tex",
+                "caption": (
+                    f"Additional ranking-quality metrics at $p = {pct}\\%$ selected features "
+                    f"(mean $\\pm$ std over {_n_folds} folds). "
+                    f"All metrics in this table are higher-is-better. "
+                    f"Best per dataset in bold."
+                ),
+                "label": f"tab:stacked_prauc_{grid_mode}",
+            },
+        ]
+        for tbl in stacked_tables:
+            lbl = tbl["label"]
+            if label_suffix:
+                lbl = lbl + "_" + label_suffix
+            cap = tbl["caption"]
+            if caption_note:
+                cap = cap + " " + latex_escape(caption_note)
+            (out_dir / tbl["filename"]).write_text(
+                make_stacked_metric_table_tex(
+                    methods,
+                    datasets,
+                    agg,
+                    metrics=tbl["metrics"],
+                    caption=cap,
+                    label=lbl,
+                    display_map=display_map,
+                ),
+                encoding="utf-8",
+            )
+        print(f"✓ Wrote stacked landscape tables to: {out_dir}")
 
 
 if __name__ == "__main__":

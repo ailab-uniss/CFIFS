@@ -120,7 +120,7 @@ def main() -> None:
                 # dataset may contain underscores; split from _fold
                 ds = name.rsplit("_fold", 1)[0]
                 ds_set.add(ds)
-        datasets = sorted(ds_set)
+        datasets = sorted(ds for ds in ds_set if ds.lower() != "reference")
     else:
         datasets = list(args.datasets)
 
@@ -156,7 +156,11 @@ def main() -> None:
             for i, pv in enumerate(p):
                 row = [f"{pv:.4f}"]
                 for m in args.methods:
-                    row.append(f"{curves_by_metric[metric][m].y[i]:.6f}")
+                    try:
+                        row.append(f"{curves_by_metric[metric][m].y[i]:.6f}")
+                    except IndexError:
+                        print(f"Error on {m}, len y: {len(curves_by_metric[metric][m].y)}, list p: {len(p)}, metric: {metric}")
+                        raise
                 f.write(",".join(row) + "\n")
 
     if args.no_plot:
@@ -302,7 +306,7 @@ def main() -> None:
                     else:
                         src = curves_by_metric_ds[metric][ds]
                         s = str(ds)
-                        title_ds = (s[:1].upper() + s[1:].lower()) if s else ""
+                        title_ds = s.capitalize() if s else ""
 
                     for mi, method in enumerate(args.methods):
                         disp = display_map.get(method, method)
