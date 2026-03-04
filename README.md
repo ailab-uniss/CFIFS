@@ -3,7 +3,7 @@
 Reference Python / PyTorch implementation of the method described in:
 
 > **Choquet-Based Fusion of Embedded and Spectral Scores for Multi-Label Feature Selection**
-> F. Casu, A. Lagorio & G. A. Trunfio — *Information Fusion*, 2026.
+> Submitted
 
 CFIFS produces a **single feature ranking per training fold** by:
 
@@ -226,7 +226,7 @@ If you use this code in your research, please cite:
 @article{casu2026cfifs,
   title   = {Choquet-Based Fusion of Embedded and Spectral Scores for Multi-Label Feature Selection},
   author  = {Casu, Filippo and Lagorio, Andrea and Trunfio, Giuseppe A.},
-  journal = {Information Fusion},
+  note    = {Submitted},
   year    = {2026},
 }
 ```
