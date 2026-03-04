@@ -1,3 +1,21 @@
+"""GPU-accelerated Multi-Label k-Nearest Neighbours (ML-kNN).
+
+This module provides a fast ML-kNN classifier with two backends:
+
+* **sklearn** — cosine-metric brute-force neighbours via
+  ``sklearn.neighbors.NearestNeighbors``; works on sparse CSR input.
+* **torch** — dense GPU-accelerated neighbours via PyTorch
+  matrix multiplication; recommended for n ≤ 10 000.
+
+The model is used inside CFIFS’s inner cross-validation loop (ICV)
+to evaluate candidate feature subsets.
+
+Public API
+----------
+- ``MLkNNConfig``  — frozen dataclass with all configuration knobs.
+- ``MLkNNModel``   — fit/predict model.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,6 +27,34 @@ from sklearn.neighbors import NearestNeighbors
 
 @dataclass(frozen=True)
 class MLkNNConfig:
+    """Configuration for the ML-kNN classifier.
+
+    Attributes
+    ----------
+    k : int
+        Number of nearest neighbours (default 10).
+    s : float
+        Laplace smoothing parameter (default 1.0).
+    metric : str
+        Distance metric for the sklearn backend (default ``'cosine'``).
+    backend : str
+        ``'auto'`` | ``'torch'`` | ``'sklearn'``.
+    device : str
+        ``'auto'`` | ``'cpu'`` | ``'cuda'``.
+    label_adaptive_k : bool
+        Use smaller *k* for rare labels (default ``False``).
+    label_k_min : int
+        Minimum *k* when ``label_adaptive_k`` is ``True``.
+    label_k_power : float
+        Power exponent for label-adaptive *k* scaling.
+    torch_max_train_samples : int
+        Auto backend heuristic: skip torch if n > this (0 = disable).
+    torch_min_density : float
+        Auto backend heuristic: skip torch if density < this.
+    torch_max_dense_mb : int
+        Auto backend heuristic: skip torch if estimated dense
+        memory exceeds this many MiB.
+    """
     k: int = 10
     s: float = 1.0
     metric: str = "cosine"
@@ -29,7 +75,33 @@ class MLkNNConfig:
 
 
 class MLkNNModel:
+    """Multi-Label k-Nearest Neighbours classifier.
+
+    Scope
+    -----
+    Implements the full ML-kNN algorithm (Zhang & Zhou, 2007): fit
+    computes prior and conditional probability tables from training
+    neighbours; predict_proba returns posterior label probabilities.
+    """
+
     def __init__(self, cfg: MLkNNConfig) -> None:
+        """Initialise the ML-kNN model.
+
+        Parameters
+        ----------
+        cfg : MLkNNConfig
+            Configuration object.
+
+        Preconditions
+        -------------
+        * ``cfg.k > 0`` and ``cfg.s > 0``.
+        * ``cfg.backend`` ∈ {``'auto'``, ``'torch'``, ``'sklearn'``}.
+        * ``cfg.device``  ∈ {``'auto'``, ``'cpu'``, ``'cuda'``}.
+
+        Postconditions
+        --------------
+        * The model is initialised but **not** fitted.
+        """
         if cfg.k <= 0:
             raise ValueError("k must be > 0")
         if cfg.s <= 0:
@@ -83,6 +155,26 @@ class MLkNNModel:
         self._y_train: sparse.csr_matrix | None = None
 
     def _select_backend(self, x_train: sparse.csr_matrix) -> str:
+        """Choose between 'torch' and 'sklearn' for the given training data.
+
+        Scope
+        -----
+        Applies heuristics based on matrix size, density, and estimated
+        GPU memory to decide which backend is most efficient.
+
+        Parameters
+        ----------
+        x_train : csr_matrix of shape (n, d)
+            Training features.
+
+        Preconditions
+        -------------
+        * Called before ``_fit_torch`` / sklearn fit.
+
+        Postconditions
+        --------------
+        * Returns ``'torch'`` or ``'sklearn'``.
+        """
         # Explicit choice always wins.
         if self._backend_requested == "sklearn":
             return "sklearn"
@@ -117,6 +209,34 @@ class MLkNNModel:
         return "torch"
 
     def _fit_torch(self, x_train: sparse.csr_matrix, y_train: sparse.csr_matrix) -> None:
+        """Fit ML-kNN using dense GPU operations.
+
+        Scope
+        -----
+        Densifies *x_train* and *y_train*, computes full pairwise
+        cosine similarity on the GPU, extracts *k* nearest
+        neighbours, and builds the prior/conditional tables.
+
+        Parameters
+        ----------
+        x_train : csr_matrix of shape (n, d)
+            Training features.
+        y_train : csr_matrix of shape (n, L)
+            Training labels.
+
+        Preconditions
+        -------------
+        * PyTorch is available and ``self._device`` is set.
+        * Matrices fit in GPU memory.
+
+        Postconditions
+        --------------
+        * ``self._prior_true_t``, ``self._prior_false_t``,
+          ``self._cond_true_t``, ``self._cond_false_t`` are set as
+          GPU tensors.
+        * ``self._xt_train`` and ``self._yt_train`` are stored for
+          prediction.
+        """
         import torch
         
         k = int(self.cfg.k)
@@ -209,6 +329,28 @@ class MLkNNModel:
         self._cond_false_t = cond_false
 
     def _predict_torch(self, x_val: sparse.csr_matrix) -> np.ndarray:
+        """Predict label probabilities using the GPU backend.
+
+        Scope
+        -----
+        Computes pairwise cosine similarity between validation
+        samples and stored training data, counts neighbour labels,
+        and applies the ML-kNN posterior formula.
+
+        Parameters
+        ----------
+        x_val : csr_matrix of shape (n_val, d)
+            Validation features.
+
+        Preconditions
+        -------------
+        * The model has been fitted via ``_fit_torch``.
+
+        Postconditions
+        --------------
+        * Returns a float NumPy array of shape (n_val, L) with
+          values in (0, 1).
+        """
         import torch
         
         xv_t = torch.from_numpy(x_val.toarray()).float().to(self._device)
@@ -288,6 +430,31 @@ class MLkNNModel:
         return probs.t().cpu().numpy() # (N_val, M)
 
     def fit(self, x_train: sparse.csr_matrix, y_train: sparse.csr_matrix) -> "MLkNNModel":
+        """Fit the ML-kNN model on training data.
+
+        Scope
+        -----
+        Selects the backend, finds *k* nearest neighbours, and
+        computes the prior and conditional probability tables
+        required for Bayesian label prediction.
+
+        Parameters
+        ----------
+        x_train : csr_matrix of shape (n, d)
+            Training features.
+        y_train : csr_matrix of shape (n, L)
+            Training labels (binary).
+
+        Preconditions
+        -------------
+        * Both matrices have the same number of rows.
+        * Labels are binary {0, 1}.
+
+        Postconditions
+        --------------
+        * The model is ready for ``predict_proba``.
+        * Returns ``self`` for method chaining.
+        """
         self._backend_selected = self._select_backend(x_train)
         if self._backend_selected == "torch":
             self._fit_torch(x_train, y_train)
@@ -362,6 +529,28 @@ class MLkNNModel:
         return self
 
     def predict_proba(self, x: sparse.csr_matrix) -> np.ndarray:
+        """Return posterior label probabilities for new samples.
+
+        Scope
+        -----
+        For each sample, finds *k* nearest training neighbours,
+        counts label occurrences, and applies Bayes’ rule with
+        the fitted prior/conditional tables.
+
+        Parameters
+        ----------
+        x : csr_matrix of shape (n_val, d)
+            Validation or test features.
+
+        Preconditions
+        -------------
+        * The model has been fitted via ``fit()``.
+
+        Postconditions
+        --------------
+        * Returns a float64 ndarray of shape (n_val, L) with
+          values in (0, 1).
+        """
         if self._backend_selected == "torch":
             return self._predict_torch(x)
             

@@ -42,7 +42,37 @@ import numpy as np
 
 @dataclass(frozen=True)
 class SLAGDParams:
-    """Parameters for Spectral Label-Aware Graph Diffusion feature selection."""
+    """Parameters for Spectral Label-Aware Graph Diffusion feature selection.
+
+    Scope
+    -----
+    Encapsulates all hyper-parameters for the SLAGD spectral scoring
+    channel.  The ``alpha`` field controls the Dirichlet-vs-HSIC blend;
+    the remaining fields configure label graph construction, optional
+    instance weighting, and the compute backend.
+
+    Attributes
+    ----------
+    alpha : float
+        Blending weight in [0, 1].  0 = pure Dirichlet smoothness,
+        1 = pure HSIC relevance.  Paper default: 0.70.
+    label_sim : str
+        Similarity measure for label-graph edges: ``'jaccard'``,
+        ``'cosine'``, or ``'hamming'``.
+    label_knn : int
+        If > 0, sparsify the label graph to *k*-NN.  0 = full graph.
+    label_self_loops : bool
+        Whether to add self-loops before computing the Laplacian.
+    instance_weight_gamma : float
+        Inverse-frequency exponent for optional instance weighting.
+        0 = uniform.
+    backend : str
+        ``'auto'`` | ``'torch'`` | ``'numpy'``.
+    device : str
+        ``'auto'`` | ``'cpu'`` | ``'cuda'``.
+    torch_dtype : str
+        ``'float32'`` or ``'float64'``.
+    """
     # Blending weight: 0 = pure Dirichlet smoothness, 1 = pure HSIC relevance.
     alpha: float = 0.50
     # Label graph construction
@@ -58,6 +88,31 @@ class SLAGDParams:
 
 
 def _to_torch(arr: np.ndarray, device, dtype):
+    """Convert a NumPy array to a contiguous PyTorch tensor on *device*.
+
+    Scope
+    -----
+    Convenience wrapper that ensures C-contiguous memory layout
+    before calling ``torch.from_numpy``, avoiding stride-related
+    errors.
+
+    Parameters
+    ----------
+    arr : ndarray
+        Source array.
+    device : torch.device
+        Target device (CPU or CUDA).
+    dtype : str
+        ``'float32'`` or ``'float64'``.
+
+    Preconditions
+    -------------
+    * PyTorch must be importable.
+
+    Postconditions
+    --------------
+    * Returns a torch.Tensor on the specified device and dtype.
+    """
     import torch
     td = {"float32": torch.float32, "float64": torch.float64}[dtype]
     return torch.from_numpy(np.ascontiguousarray(arr)).to(device=device, dtype=td)
@@ -68,8 +123,34 @@ def fit_slagd(
     Y: np.ndarray,       # (n, L) training labels {0,1} or {-1,+1}
     params: SLAGDParams | None = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """
-    Compute a training-only feature ranking.
+    """Compute a training-only spectral feature ranking.
+
+    Scope
+    -----
+    Public entry point for SLAGD.  Builds a label-affinity graph,
+    computes Dirichlet energy and HSIC for every feature, blends
+    them, and returns a 1-based feature ranking.  Automatically
+    dispatches to the NumPy or PyTorch backend.
+
+    Parameters
+    ----------
+    X : ndarray of shape (n, d)
+        Training features (preferably scaled to [0, 1]).
+    Y : ndarray of shape (n, L)
+        Binary training labels {0, 1} or {-1, +1}.
+    params : SLAGDParams | None
+        Configuration.  ``None`` uses defaults.
+
+    Preconditions
+    -------------
+    * *X* and *Y* share the same *n*.
+    * *Y* contains at least one positive entry.
+
+    Postconditions
+    --------------
+    * ``ranking`` is a permutation of {1, …, d}, best first.
+    * ``info`` contains ``'scores_min'``, ``'scores_max'``,
+      ``'scores_mean'``, ``'alpha'``, and ``'backend_used'``.
 
     Returns
     -------
@@ -121,7 +202,31 @@ def fit_slagd(
 
 
 def _build_label_affinity(Y: np.ndarray, sim: str) -> np.ndarray:
-    """Build (n, n) label similarity matrix."""
+    """Build a symmetric (n, n) label-based affinity matrix.
+
+    Scope
+    -----
+    Measures pairwise similarity between instances based on their
+    label vectors.  The diagonal is set to zero so that the
+    resulting graph has no self-loops.
+
+    Parameters
+    ----------
+    Y : ndarray of shape (n, L)
+        Binary label matrix {0, 1}.
+    sim : str
+        Similarity metric: ``'jaccard'``, ``'cosine'``, or
+        ``'hamming'``.
+
+    Preconditions
+    -------------
+    * *Y* is binary and non-empty.
+
+    Postconditions
+    --------------
+    * Returns a symmetric float64 matrix with zero diagonal.
+    * All entries are in [0, 1].
+    """
     n = Y.shape[0]
     if sim == "jaccard":
         # Jaccard: |A ∩ B| / |A ∪ B|
@@ -146,7 +251,31 @@ def _build_label_affinity(Y: np.ndarray, sim: str) -> np.ndarray:
 
 
 def _sparsify_knn(A: np.ndarray, k: int) -> np.ndarray:
-    """Keep only k nearest neighbors per row (symmetrize by max)."""
+    """Keep only the *k* nearest neighbours per row and symmetrise.
+
+    Scope
+    -----
+    Sparsifies a dense affinity matrix by retaining only the top-*k*
+    entries per row, then symmetrises via element-wise maximum so
+    that the resulting graph is undirected.
+
+    Parameters
+    ----------
+    A : ndarray of shape (n, n)
+        Dense affinity matrix.
+    k : int
+        Number of neighbours to keep.  If *k* ≤ 0 or *k* ≥ n the
+        matrix is returned unchanged.
+
+    Preconditions
+    -------------
+    * *A* is square and non-negative.
+
+    Postconditions
+    --------------
+    * Returns a symmetric matrix of the same shape.
+    * Each row has at most 2*k* non-zero entries (after symmetrisation).
+    """
     n = A.shape[0]
     if k <= 0 or k >= n:
         return A
@@ -162,6 +291,39 @@ def _sparsify_knn(A: np.ndarray, k: int) -> np.ndarray:
 def _fit_numpy(
     X: np.ndarray, Y: np.ndarray, params: SLAGDParams
 ) -> Tuple[np.ndarray, np.ndarray, dict]:
+    """NumPy backend for SLAGD spectral scoring.
+
+    Scope
+    -----
+    Computes the full SLAGD pipeline on CPU: label affinity →
+    normalised Laplacian → Dirichlet energy → HSIC → blend → ranking.
+
+    Parameters
+    ----------
+    X : ndarray of shape (n, d)
+        Training features.
+    Y : ndarray of shape (n, L)
+        Binary training labels {0, 1}.
+    params : SLAGDParams
+        Configuration (label_sim, alpha, etc.).
+
+    Preconditions
+    -------------
+    * *X* and *Y* satisfy the constraints of :func:`fit_slagd`.
+
+    Postconditions
+    --------------
+    * ``ranking`` is 1-based, sorted by descending *scores*.
+    * ``scores`` ∈ [0, 1]^d.
+    * ``extra`` dict contains ``'dirichlet_mean'``, ``'hsic_mean'``,
+      ``'alpha'``, ``'backend_used'``.
+
+    Returns
+    -------
+    ranking : ndarray (d,)
+    scores  : ndarray (d,)
+    extra   : dict
+    """
     n, d = X.shape
     eps = 1e-10
 
@@ -240,6 +402,40 @@ def _fit_numpy(
 def _fit_torch(
     X: np.ndarray, Y: np.ndarray, params: SLAGDParams, device
 ) -> Tuple[np.ndarray, np.ndarray, dict]:
+    """PyTorch backend for SLAGD spectral scoring.
+
+    Scope
+    -----
+    GPU-accelerated version of :func:`_fit_numpy`.  All O(n² d)
+    operations (Laplacian products, HSIC kernel products) are
+    executed on *device*.  Results are moved back to CPU/NumPy
+    before returning.
+
+    Parameters
+    ----------
+    X : ndarray of shape (n, d)
+        Training features (NumPy, converted internally).
+    Y : ndarray of shape (n, L)
+        Binary training labels.
+    params : SLAGDParams
+        Configuration.
+    device : torch.device
+        Target device (e.g. ``torch.device('cuda')``).
+
+    Preconditions
+    -------------
+    * PyTorch is installed; *device* is available.
+
+    Postconditions
+    --------------
+    * Same return contract as :func:`_fit_numpy`; all arrays on CPU.
+
+    Returns
+    -------
+    ranking : ndarray (d,)
+    scores  : ndarray (d,)
+    extra   : dict
+    """
     import torch
     n, d = X.shape
     eps = 1e-10

@@ -152,14 +152,6 @@ pyproject.toml                  # package metadata (pip install -e .)
 
 ---
 
-## Reproducibility notes
-
-- **Training-only preprocessing:** every statistic (label embedding, rarity weights, affinity graph) is computed on the training fold only — no test information leaks.
-- **Scaling:** data is min-max normalised to [0, 1] per fold (fit on train, applied to test).
-- **Determinism:** all random seeds are fixed (default seed 42).  NumPy RNG is used even in the PyTorch solver to guarantee cross-backend reproducibility.
-
----
-
 ## Citation
 
 If you use this code in your research, please cite:

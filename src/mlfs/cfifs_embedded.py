@@ -45,6 +45,27 @@ from ._components.instance_weights import (
 # ---------------------------------------------------------------------------
 
 def _sigmoid(z: np.ndarray) -> np.ndarray:
+    """Numerically stable element-wise sigmoid σ(z) = 1/(1+exp(−z)).
+
+    Scope
+    -----
+    Avoids overflow by branching on the sign of each element:
+    σ(z)=1/(1+e^{-z}) for z≥0; σ(z)=e^z/(1+e^z) for z<0.
+
+    Parameters
+    ----------
+    z : ndarray
+        Input array of any shape.
+
+    Preconditions
+    -------------
+    * *z* must be convertible to ``float64``.
+
+    Postconditions
+    --------------
+    * Returns an array of the same shape with values in (0, 1).
+    * No NaN / Inf entries are produced for finite inputs.
+    """
     z = np.asarray(z, dtype=np.float64)
     out = np.empty_like(z)
     pos = z >= 0
@@ -57,7 +78,31 @@ def _sigmoid(z: np.ndarray) -> np.ndarray:
 def _power_iteration_xtx_eigmax(
     X: np.ndarray, *, n_iter: int = 25, seed: int = 0,
 ) -> float:
-    """Estimate largest eigenvalue of X^T X via power iteration."""
+    """Estimate the largest eigenvalue of X^T X via power iteration.
+
+    Scope
+    -----
+    Used to compute the Lipschitz constant of the smooth part of the
+    objective, which determines the FISTA step size.
+
+    Parameters
+    ----------
+    X : ndarray of shape (n, d)
+        Data matrix (may be instance-weighted: X_s = X * √s).
+    n_iter : int
+        Number of power-iteration sweeps (default 25).
+    seed : int
+        Seed for the random starting vector.
+
+    Preconditions
+    -------------
+    * *X* must be a 2-D finite array.
+
+    Postconditions
+    --------------
+    * Returns a non-negative float approximating λ_max(X^T X).
+    * Returns 0.0 if *X* is numerically zero.
+    """
     Xop = np.asarray(X, dtype=np.float64)
     d = int(Xop.shape[1])
     rng = np.random.default_rng(int(seed))
@@ -82,7 +127,34 @@ def _power_iteration_xtx_eigmax(
 def _prox_group_lasso_rows(
     W: np.ndarray, lam: float, *, eps: float = 1e-12,
 ) -> np.ndarray:
-    """Row-wise block soft-thresholding (group-lasso proximal operator)."""
+    """Row-wise block soft-thresholding (group-lasso proximal operator).
+
+    Scope
+    -----
+    Computes prox_{λ‖·‖_{2,1}}(W) row by row:
+        W_{j:} ← W_{j:} · max(0, 1 − λ/‖W_{j:}‖₂)
+    Rows whose norm is below *λ* are driven to zero, achieving
+    feature-level sparsity.
+
+    Parameters
+    ----------
+    W : ndarray of shape (d, r)
+        Current projection matrix.
+    lam : float
+        Proximal threshold (= step_size × β).
+    eps : float
+        Small constant to avoid division by zero.
+
+    Preconditions
+    -------------
+    * *W* is 2-D with dtype castable to float64.
+    * *lam* ≥ 0.
+
+    Postconditions
+    --------------
+    * Returns an array of the same shape as *W*.
+    * Rows with ‖W_{j:}‖₂ ≤ lam are exactly zero.
+    """
     W = np.asarray(W, dtype=np.float64)
     norms = np.linalg.norm(W, axis=1)
     scale = np.maximum(0.0, 1.0 - float(lam) / (norms + float(eps)))
@@ -96,7 +168,33 @@ def _prox_group_lasso_rows(
 def _label_tail_weights(
     Y01: np.ndarray, *, label_gamma: float, eps: float,
 ) -> np.ndarray:
-    r"""Inverse-frequency tail weighting: w_l \propto (freq_l + 1)^{-\gamma/2}."""
+    r"""Inverse-frequency tail weighting for the label embedding.
+
+    Scope
+    -----
+    Computes per-label weights  w_l ∝ (freq_l + 1)^{−γ/2}  and normalises
+    them so that their mean equals 1.  Labels with fewer positive
+    instances receive higher weight, focusing the embedding on the
+    tail of the label distribution.
+
+    Parameters
+    ----------
+    Y01 : ndarray of shape (n, L)
+        Binary label matrix {0, 1}.
+    label_gamma : float
+        Tail exponent.  0 → uniform weights; larger → stronger
+        emphasis on rare labels.
+    eps : float
+        Stabiliser for division.
+
+    Preconditions
+    -------------
+    * *Y01* has at least one positive entry.
+
+    Postconditions
+    --------------
+    * Returns a 1-D array of shape (L,) with mean ≈ 1.
+    """
     Y01 = (np.asarray(Y01) > 0).astype(np.float64, copy=False)
     freq = np.sum(Y01, axis=0).astype(np.float64) + 1.0
     w_lab = (freq ** (-0.5 * float(label_gamma))).astype(np.float64, copy=False)
@@ -112,6 +210,37 @@ def _label_embedding_from_Y(
     seed: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """PLST-style label embedding via SVD of the tail-weighted label matrix.
+
+    Scope
+    -----
+    Builds a low-rank target matrix T = (Y ⊙ w_lab) V used as
+    reconstruction target in the embedded solver.  The SVD of the
+    weighted label matrix Y_w = Y · diag(w_lab) provides an
+    orthonormal basis V ∈ ℝ^{L×r} that captures the dominant
+    co-occurrence structure of the labels.
+
+    Parameters
+    ----------
+    Y01 : ndarray of shape (n, L)
+        Binary label matrix {0, 1}.
+    rank : int
+        Target dimensionality *r* of the embedding (capped at
+        min(n, L)).
+    label_gamma : float
+        Tail exponent forwarded to ``_label_tail_weights``.
+    seed : int
+        RNG seed used as fallback if the initial SVD fails.
+
+    Preconditions
+    -------------
+    * *Y01* must be binary with at least one positive entry.
+    * *rank* ≥ 1.
+
+    Postconditions
+    --------------
+    * ``V`` has orthonormal columns (V^T V ≈ I_r).
+    * ``w_lab`` has mean ≈ 1.
+    * ``svals`` are non-negative and sorted in descending order.
 
     Returns
     -------
@@ -197,16 +326,45 @@ def fit_cfifs(
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Run the CFIFS embedded stage and return ``(ranking, info)``.
 
+    Scope
+    -----
+    Public entry point for the embedded scoring channel of CFIFS.
+    Solves the group-sparse convex objective via FISTA, extracts
+    per-feature importance as the row norms of the learned
+    projection matrix W, and returns a 1-based feature ranking.
+    Automatically dispatches to the NumPy (CPU) or PyTorch (GPU)
+    backend according to ``params.backend``.
+
     Parameters
     ----------
-    X : (n, d) training features.
-    Y : (n, L) training labels in {0, 1} or {-1, +1}.
-    params : solver configuration (defaults are fine for paper reproduction).
+    X : ndarray of shape (n, d)
+        Training features (preferably min-max scaled to [0, 1]).
+    Y : ndarray of shape (n, L)
+        Training labels in {0, 1} or {-1, +1} (converted internally).
+    params : CFIFSParams | dict | None
+        Solver configuration.  ``None`` uses paper defaults.
+
+    Preconditions
+    -------------
+    * *X* and *Y* must share the same number of rows *n*.
+    * *X* is finite and non-empty (n ≥ 1, d ≥ 1).
+    * *Y* has at least one positive entry per label column.
+    * If ``params.backend == 'torch'``, PyTorch must be installed.
+
+    Postconditions
+    --------------
+    * ``ranking`` is a permutation of {1, …, d}, best feature first.
+    * ``info['scores']`` is a float64 array of shape (d,) with
+      per-feature importance (row norms of W).  Higher is better.
+    * ``info`` also contains solver diagnostics: iteration count,
+      objective start/end values, step sizes, and hyper-parameter echo.
 
     Returns
     -------
-    ranking : (d,) 1-based feature indices sorted best -> worst.
-    info    : diagnostic dict including ``"scores"`` (per-feature importances).
+    ranking : ndarray of shape (d,), dtype int64
+        1-based feature indices sorted best → worst.
+    info : dict
+        Diagnostic dictionary.
     """
     if params is None:
         p = CFIFSParams()
@@ -352,6 +510,28 @@ def fit_cfifs(
 # ---------------------------------------------------------------------------
 
 def _torch_dtype_from_str(name: str):
+    """Convert a string identifier to a ``torch.dtype``.
+
+    Scope
+    -----
+    Maps user-friendly names (``'float32'``, ``'fp64'``, …) to the
+    corresponding PyTorch dtype for the GPU solver.
+
+    Parameters
+    ----------
+    name : str
+        One of ``'float32'``, ``'fp32'``, ``'f32'``,
+        ``'float64'``, ``'fp64'``, ``'f64'``.
+
+    Preconditions
+    -------------
+    * PyTorch must be importable.
+
+    Postconditions
+    --------------
+    * Returns ``torch.float32`` or ``torch.float64``.
+    * Raises ``ValueError`` for unsupported names.
+    """
     import torch
     name0 = str(name).lower().strip()
     if name0 in ("float32", "fp32", "f32"):
@@ -362,6 +542,30 @@ def _torch_dtype_from_str(name: str):
 
 
 def _power_iteration_xtx_eigmax_torch(X, *, n_iter: int, seed: int) -> float:
+    """PyTorch analogue of :func:`_power_iteration_xtx_eigmax`.
+
+    Scope
+    -----
+    Estimates λ_max(X^T X) on the same device as *X* using power
+    iteration, enabling GPU-accelerated Lipschitz constant estimation.
+
+    Parameters
+    ----------
+    X : torch.Tensor of shape (n, d)
+        Data matrix (already on the target device).
+    n_iter : int
+        Number of power-iteration sweeps.
+    seed : int
+        Seed for the random starting vector.
+
+    Preconditions
+    -------------
+    * *X* is a 2-D torch.Tensor.
+
+    Postconditions
+    --------------
+    * Returns a non-negative Python float.
+    """
     import torch
     d = int(X.shape[1])
     gen = torch.Generator(device=X.device)
@@ -385,6 +589,31 @@ def _power_iteration_xtx_eigmax_torch(X, *, n_iter: int, seed: int) -> float:
 
 
 def _prox_group_lasso_rows_torch(W, lam, *, eps: float = 1e-12):
+    """PyTorch analogue of :func:`_prox_group_lasso_rows`.
+
+    Scope
+    -----
+    Row-wise block soft-thresholding on a GPU tensor, used inside
+    the PyTorch FISTA loop.
+
+    Parameters
+    ----------
+    W : torch.Tensor of shape (d, r)
+        Current projection matrix.
+    lam : float
+        Proximal threshold (= step_size × β).
+    eps : float
+        Numerical stabiliser.
+
+    Preconditions
+    -------------
+    * *W* is a 2-D torch.Tensor.  *lam* ≥ 0.
+
+    Postconditions
+    --------------
+    * Returns a tensor of the same shape; rows with norm ≤ *lam*
+      are zeroed.
+    """
     import torch
     norms = torch.linalg.norm(W, dim=1)
     scale = torch.clamp(1.0 - float(lam) / (norms + float(eps)), min=0.0)
@@ -396,7 +625,33 @@ def _fit_cfifs_torch(
     Y: np.ndarray,
     p: CFIFSParams,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Dense PyTorch backend (GPU-friendly) for the CFIFS embedded stage."""
+    """Dense PyTorch backend (GPU-friendly) for the CFIFS embedded stage.
+
+    Scope
+    -----
+    Mirrors the NumPy solver path but executes all matrix operations
+    on the device specified in *p.device* (CPU or CUDA).  Recommended
+    when d > 500 or n > 2000.
+
+    Parameters
+    ----------
+    X : ndarray of shape (n, d)
+        Training features (NumPy, converted internally).
+    Y : ndarray of shape (n, L)
+        Binary training labels.
+    p : CFIFSParams
+        Solver configuration (must have ``backend='torch'``).
+
+    Preconditions
+    -------------
+    * PyTorch is installed and the requested device is available.
+    * *X* and *Y* satisfy the same constraints as :func:`fit_cfifs`.
+
+    Postconditions
+    --------------
+    * Returns ``(ranking, info)`` with the same contract as the
+      NumPy path.  All returned arrays are NumPy on CPU.
+    """
     import torch
     import torch.nn.functional as F
 

@@ -42,7 +42,28 @@ sys.path.insert(0, str(ROOT / "src"))
 # ── Helpers ─────────────────────────────────────────────────────────────
 
 def _rank_uniform(v: np.ndarray) -> np.ndarray:
-    """Empirical CDF (rank) normalisation to (0, 1)."""
+    """Empirical-CDF (rank) normalisation to (0, 1).
+
+    Scope
+    -----
+    Maps raw scores to their rank-based quantiles so that both
+    the embedded and spectral channels live on a comparable [0, 1]
+    scale before Choquet fusion.
+
+    Parameters
+    ----------
+    v : ndarray of shape (d,)
+        Raw per-feature scores.
+
+    Preconditions
+    -------------
+    * *v* is a 1-D finite array.
+
+    Postconditions
+    --------------
+    * Returns an array of the same shape with values in (0, 1).
+    * Tied scores receive averaged ranks.
+    """
     from scipy.stats import rankdata
     v = np.asarray(v, dtype=np.float64).ravel()
     n = v.size
@@ -53,7 +74,36 @@ def _rank_uniform(v: np.ndarray) -> np.ndarray:
 
 def _choquet_2src(e: np.ndarray, s: np.ndarray,
                   *, mu_e: float, mu_s: float) -> np.ndarray:
-    """2-source Choquet integral (element-wise)."""
+    """Element-wise 2-source Choquet integral.
+
+    Scope
+    -----
+    Fuses two normalised score vectors (embedded *e* and spectral *s*)
+    using a 2-additive fuzzy measure defined by the singleton
+    capacities (μ_e, μ_s).  The interaction index
+    I = 1 − μ_e − μ_s captures complementarity (I < 0 →
+    redundancy, I > 0 → synergy).
+
+    Parameters
+    ----------
+    e : ndarray of shape (d,)
+        Rank-normalised embedded scores.
+    s : ndarray of shape (d,)
+        Rank-normalised spectral scores.
+    mu_e : float
+        Singleton capacity for the embedded source ∈ [0, 1].
+    mu_s : float
+        Singleton capacity for the spectral source ∈ [0, 1].
+
+    Preconditions
+    -------------
+    * *e*, *s* ∈ [0, 1]^d (rank-normalised).
+    * 0 ≤ μ_e, μ_s ≤ 1  and  μ_e + μ_s ≤ 1  (monotonicity).
+
+    Postconditions
+    --------------
+    * Returns an array of shape (d,) in [0, 1].
+    """
     e, s = np.asarray(e, np.float64), np.asarray(s, np.float64)
     out = np.empty_like(e)
     mask = e >= s
@@ -64,7 +114,49 @@ def _choquet_2src(e: np.ndarray, s: np.ndarray,
 
 def _icv_select(emb_n, spec_n, X, Y, *, p_frac, cv, grid, mlknn_k,
                 device, seed):
-    """Select (μₑ, μₛ) via inner K-fold CV on ML-kNN (GM of micro/macro F1)."""
+    """Select Choquet capacities (μ_e, μ_s) via inner K-fold CV.
+
+    Scope
+    -----
+    Exhaustively searches a grid of (mu_e, mu_s) pairs, fuses the
+    two score vectors with the Choquet integral, selects the top
+    *p_frac* fraction of features, evaluates ML-kNN on inner folds,
+    and picks the pair that maximises the geometric mean of
+    Micro-F1 and Macro-F1.  This is the ICV step described in
+    § 3.5 of the paper.
+
+    Parameters
+    ----------
+    emb_n : ndarray of shape (d,)
+        Rank-normalised embedded scores.
+    spec_n : ndarray of shape (d,)
+        Rank-normalised spectral scores.
+    X : ndarray of shape (n, d)
+        Training features.
+    Y : ndarray of shape (n, L)
+        Training labels {0, 1}.
+    p_frac : float
+        Fraction of features to select for evaluation (e.g. 0.20).
+    cv : int
+        Number of inner CV folds.
+    grid : ndarray of shape (g,)
+        Candidate capacity values.
+    mlknn_k : int
+        *k* for ML-kNN.
+    device : str
+        ``'cpu'`` or ``'cuda'``.
+    seed : int
+        Random seed for the inner KFold splits.
+
+    Preconditions
+    -------------
+    * *emb_n* and *spec_n* are in [0, 1] and have the same length.
+    * ``scikit-learn``, ``scipy``, and ``mlfs.ml_knn_gpu`` are available.
+
+    Postconditions
+    --------------
+    * Returns ``(best_mu_e, best_mu_s, best_gm_score)``.
+    """
     from sklearn.model_selection import KFold
     from scipy import sparse as sp
     from mlfs.ml_knn_gpu import MLkNNConfig, MLkNNModel
@@ -132,6 +224,24 @@ ABLATION_VARIANTS = {
 # ── Main ────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    """CLI entry point for the CFIFS demo.
+
+    Scope
+    -----
+    Parses command-line arguments, loads a ``.mat`` dataset, runs
+    the embedded stage (and optionally spectral + Choquet fusion),
+    and prints the resulting feature ranking to stdout.
+
+    Preconditions
+    -------------
+    * A ``.mat`` file with ``X_train`` and ``Y_train`` must exist
+      (the bundled *emotions* fold is the default).
+
+    Postconditions
+    --------------
+    * Prints timing, top-*k* features, and (if ``--full``) the
+      selected Choquet capacities.
+    """
     variant_names = list(ABLATION_VARIANTS.keys())
     ap = argparse.ArgumentParser(
         description="CFIFS demo — Choquet Fuzzy-Integral Feature Selection",
