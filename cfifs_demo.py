@@ -15,7 +15,15 @@ Usage
 
     # Custom data
     python cfifs_demo.py --mat path/to/fold.mat --full
-"""
+    # Paper ablation variants (embedded-only, different α / weight settings)
+    python cfifs_demo.py --variant CFIFS_EMB    # full embedded solver, no fusion
+    python cfifs_demo.py --variant ACSF_REG     # regression-only (α=0)
+    python cfifs_demo.py --variant ACSF_LOG     # logistic-only  (α=1)
+    python cfifs_demo.py --variant ACSF_NOWT    # no instance weights
+    python cfifs_demo.py --variant ACSF_SIMPLE  # simplest ℓ₂₁ regression
+
+    # Or set α and weights manually
+    python cfifs_demo.py --alpha 0.5 --no-weights"""
 from __future__ import annotations
 
 import argparse
@@ -109,11 +117,32 @@ def _icv_select(emb_n, spec_n, X, Y, *, p_frac, cv, grid, mlknn_k,
     return best_mu_e, best_mu_s, best_score
 
 
+# ── Ablation variants (Table 5 of the paper) ───────────────────────────
+
+ABLATION_VARIANTS = {
+    "CFIFS":        dict(alpha=0.35, use_instance_weights=True,  full=True),
+    "CFIFS_EMB":    dict(alpha=0.35, use_instance_weights=True,  full=False),
+    "ACSF_REG":     dict(alpha=0.0,  use_instance_weights=True,  full=False),
+    "ACSF_LOG":     dict(alpha=1.0,  use_instance_weights=True,  full=False),
+    "ACSF_NOWT":    dict(alpha=0.35, use_instance_weights=False, full=False),
+    "ACSF_SIMPLE":  dict(alpha=0.0,  use_instance_weights=False, full=False),
+}
+
+
 # ── Main ────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    variant_names = list(ABLATION_VARIANTS.keys())
     ap = argparse.ArgumentParser(
-        description="CFIFS demo — Choquet Fuzzy-Integral Feature Selection")
+        description="CFIFS demo — Choquet Fuzzy-Integral Feature Selection",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Ablation variants (--variant):\n"
+               "  CFIFS        full pipeline (embedded + spectral + Choquet)\n"
+               "  CFIFS_EMB    embedded solver only (α=0.35, weights ON)\n"
+               "  ACSF_REG    regression-only (α=0, weights ON)\n"
+               "  ACSF_LOG    logistic-only  (α=1, weights ON)\n"
+               "  ACSF_NOWT   full solver, no instance weights\n"
+               "  ACSF_SIMPLE simplest ℓ₂₁ regression (α=0, no weights)")
     ap.add_argument(
         "--mat", type=Path,
         default=ROOT / "example" / "emotions_fold0.mat",
@@ -123,11 +152,34 @@ def main() -> None:
         "--full", action="store_true",
         help="Run the full pipeline (embedded + spectral + Choquet fusion).  "
              "Without this flag only the embedded stage is executed.")
+    ap.add_argument(
+        "--variant", type=str, default=None, choices=variant_names,
+        metavar="NAME",
+        help="Run a named ablation variant (overrides --full/--alpha/--no-weights).")
+    ap.add_argument("--alpha", type=float, default=None,
+                    help="Trade-off α ∈ [0,1]: 0 = regression-only, "
+                         "1 = logistic-only (default: 0.35).")
+    ap.add_argument("--no-weights", action="store_true",
+                    help="Disable rarity-aware instance weighting.")
     ap.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
                     help="Compute device (default: cpu).")
     ap.add_argument("--top-k", type=int, default=15,
                     help="Number of top features to display (default: 15).")
     args = ap.parse_args()
+
+    # Resolve ablation configuration
+    if args.variant is not None:
+        vcfg = ABLATION_VARIANTS[args.variant]
+        alpha = vcfg["alpha"]
+        use_weights = vcfg["use_instance_weights"]
+        run_full = vcfg["full"]
+        print(f"Variant:  {args.variant}  "
+              f"(α={alpha}, weights={'ON' if use_weights else 'OFF'}, "
+              f"fusion={'YES' if run_full else 'NO'})\n")
+    else:
+        alpha = args.alpha if args.alpha is not None else 0.35
+        use_weights = not args.no_weights
+        run_full = args.full
 
     # ── Load data ───────────────────────────────────────────────────────
     mat_path: Path = args.mat
@@ -149,14 +201,19 @@ def main() -> None:
     from mlfs import CFIFSParams, fit_cfifs
 
     t0 = time.time()
-    emb_params = CFIFSParams(backend=backend, device=args.device)
+    emb_params = CFIFSParams(
+        alpha=alpha,
+        use_instance_weights=use_weights,
+        backend=backend,
+        device=args.device,
+    )
     emb_ranking, emb_info = fit_cfifs(X, Y, emb_params)
     emb_scores = np.asarray(emb_info["scores"], dtype=np.float64)
     t_emb = time.time() - t0
-    print(f"[Embedded]  {t_emb:.2f}s  —  top features: "
-          f"{emb_ranking[:args.top_k].tolist()}")
+    print(f"[Embedded]  {t_emb:.2f}s  (α={alpha}, weights={'ON' if use_weights else 'OFF'})")
+    print(f"  top features: {emb_ranking[:args.top_k].tolist()}")
 
-    if not args.full:
+    if not run_full:
         print(f"\nDone (embedded only).  Ranking length = {len(emb_ranking)}")
         return
 

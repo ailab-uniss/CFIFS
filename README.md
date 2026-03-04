@@ -70,6 +70,36 @@ python cfifs_demo.py --mat path/to/my_data.mat --full --device cuda
 
 ---
 
+## Ablation variants
+
+The demo supports all ablation configurations from Table 5 of the paper:
+
+```bash
+python cfifs_demo.py --variant CFIFS        # full pipeline (emb + spectral + Choquet)
+python cfifs_demo.py --variant CFIFS_EMB    # embedded solver only (α=0.35, weights ON)
+python cfifs_demo.py --variant ACSF_REG     # regression-only  (α=0)
+python cfifs_demo.py --variant ACSF_LOG     # logistic-only   (α=1)
+python cfifs_demo.py --variant ACSF_NOWT    # no instance weights
+python cfifs_demo.py --variant ACSF_SIMPLE  # simplest ℓ₂₁ regression (α=0, no weights)
+```
+
+Or set parameters manually:
+
+```bash
+python cfifs_demo.py --alpha 0.5 --no-weights --full --device cuda
+```
+
+| Variant | α | Inst. weights | Spectral + Choquet |
+|---------|---|:---:|:---:|
+| `CFIFS` | 0.35 | ✓ | ✓ |
+| `CFIFS_EMB` | 0.35 | ✓ | ✗ |
+| `ACSF_REG` | 0.0 | ✓ | ✗ |
+| `ACSF_LOG` | 1.0 | ✓ | ✗ |
+| `ACSF_NOWT` | 0.35 | ✗ | ✗ |
+| `ACSF_SIMPLE` | 0.0 | ✗ | ✗ |
+
+---
+
 ## Python API
 
 ```python
